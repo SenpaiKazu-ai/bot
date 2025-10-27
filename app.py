@@ -1,6 +1,7 @@
 from flask import Flask, request
 import requests
 import google.generativeai as genai
+import shelve
 
 app = Flask(__name__)
 
@@ -8,6 +9,33 @@ app = Flask(__name__)
 PAGE_ACCESS_TOKEN = "EAAV2ZCNDNgv0BP38JFnsFXVOc5XIJ7rYBiOZAXSqNbVZBmrMgQvDCKXTzwz9umUDH6sRRtqZBOlGBkVGtWxZCr9gilya4ng84bgDmHOjr8lAGnPICn3kMidNqKLZAY5kJtuoldWwbZCISU38pwXn8T2T7TcNhZAFdhrsgXxF7e68RrkvlbQZAXedtZBypz3tN0gXCgT86iHmYIEnToVbNsuu9yuZCRzYoSDFSZAeJWIBANUZD"
 VERIFY_TOKEN = "chatgptbot_verify_key"
 GEMINI_API_KEY = "AIzaSyBjNO2w7BAyOIKQ7REiDqnT8cSI6witaeI"
+
+# --- Conversation store (persisted) ---
+CONVERSATIONS_DB = "conversations.db"  # file used by shelve
+MAX_HISTORY = 12  # max messages to keep (user+assistant entries)
+
+try:
+    db = shelve.open(CONVERSATIONS_DB, writeback=True)
+except Exception:
+    # fallback to in-memory dict if shelve fails
+    db = {}
+
+def load_history(user_id):
+    try:
+        return db.get(str(user_id), []).copy()
+    except Exception:
+        return []
+
+def save_history(user_id, history):
+    try:
+        db[str(user_id)] = history
+        if hasattr(db, "sync"):
+            db.sync()
+    except Exception:
+        pass
+
+def clear_history(user_id):
+    save_history(user_id, [])
 
 # --- Configure Gemini ---
 genai.configure(api_key=GEMINI_API_KEY)
@@ -31,23 +59,52 @@ def webhook():
             for event in entry.get("messaging", []):
                 if "message" in event:
                     sender_id = event["sender"]["id"]
-                    message_text = event["message"].get("text", "").lower()
+                    message_text = event["message"].get("text", "")
+                    message_text_lower = message_text.lower().strip()
+
+                    # --- Reset conversation ---
+                    if message_text_lower in ["reset", "start over", "clear"]:
+                        clear_history(sender_id)
+                        send_message(sender_id, "✅ Conversation reset. How can I help you now?")
+                        continue
 
                     # --- Greeting check ---
-                    if any(word in message_text for word in ["hi", "hello", "hey", "start"]):
+                    if any(word in message_text_lower for word in ["hi", "hello", "hey"]) and len(message_text_lower) < 20:
                         greeting = "👋 Hi! This bot is made by *Jhun Mark Premacio*.\nHow can I help you today?"
                         send_message(sender_id, greeting)
                         continue  # stop here, don’t send to Gemini yet
 
-                    # --- Normal flow (Gemini reply) ---
-                    reply = gemini_reply(message_text)
+                    # --- Conversation-aware flow (Gemini reply) ---
+                    history = load_history(sender_id)
+
+                    # Append user's incoming message to history
+                    history.append({"role": "user", "text": message_text})
+
+                    # Trim history to keep size bounded
+                    if len(history) > MAX_HISTORY:
+                        history = history[-MAX_HISTORY:]
+
+                    reply = gemini_reply(history)  # send full history
                     send_message(sender_id, reply)
+
+                    # Save assistant reply back to history
+                    history.append({"role": "assistant", "text": reply})
+                    if len(history) > MAX_HISTORY:
+                        history = history[-MAX_HISTORY:]
+                    save_history(sender_id, history)
     return "ok", 200
 
-def gemini_reply(text):
+def gemini_reply(history):
     try:
+        # Convert conversation history into the format expected by the SDK
+        messages = []
+        for item in history:
+            role = item.get("role", "user")
+            text = item.get("text", "")
+            messages.append({"role": role, "parts": [text]})
+
         response = model.generate_content(
-            [ {"role": "user", "parts": [text]} ],
+            messages,
             generation_config={
                 "temperature": 0.8,
                 "max_output_tokens": 300,
@@ -81,3 +138,8 @@ def send_message(recipient_id, text):
 
 if __name__ == "__main__":
     app.run(port=5000)
+
+
+
+
+
